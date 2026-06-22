@@ -52,3 +52,18 @@ services:
   Genaker\Bundle\ComiVoyager\Command\OptimizeRouteCommand:
     arguments:
       $distanceProviders: !tagged_iterator genaker_comivoyager.distance_provider
+
+  Genaker\Bundle\ComiVoyager\Core\Clustering\KMeansClusterer: ~
+
+  Genaker\Bundle\ComiVoyager\Core\Clustering\CapacityAdjuster: ~
+
+  Genaker\Bundle\ComiVoyager\Core\Solver\VRPSolver:
+    arguments:
+      $distanceProvider: '@Genaker\Bundle\ComiVoyager\Core\Distance\HaversineDistanceMatrixProvider'
+
+  Genaker\Bundle\ComiVoyager\Controller\VRPController:
+    public: true
+    tags: ['controller.service_arguments']
+
+  Genaker\Bundle\ComiVoyager\Command\VRPOptimizeCommand:
+    tags: ['console.command']
