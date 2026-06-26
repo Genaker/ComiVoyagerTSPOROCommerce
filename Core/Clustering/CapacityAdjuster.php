@@ -120,7 +120,7 @@ final class CapacityAdjuster
     {
         $stops = $route->getStops();
         if (empty($stops)) {
-            return $route->getVehicle()->getDepot();
+            return $route->getVehicle()->getStartLocation();
         }
         $lat = 0.0;
         $lng = 0.0;

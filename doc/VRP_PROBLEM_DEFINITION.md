@@ -64,15 +64,37 @@ Orders (ready to ship):
   - time_window: {start, end}     # optional delivery window
   - customer_id: string           # for grouping same-customer orders
 
-Vehicles:
-  - count: K                      # number of trucks available
+Vehicles / Drivers:
+  - count: K                      # number of trucks / delivery drivers
   - capacity_lbs: float           # weight limit per truck
   - capacity_cuft: float          # optional volume limit
-  - max_stops: int                # optional max deliveries per truck
-  - max_distance_miles: float     # optional range limit
-  - start_location: {lat, lng}    # usually = warehouse
-  - return_to_depot: bool         # must return to warehouse?
+  - max_stops: int                # optional max deliveries per driver
+  - max_distance_miles: float     # optional driving-distance cap per shift
+  - start: {lat, lng}             # driver's home / start point (defaults to depot)
+  - end: {lat, lng}               # optional explicit end point
+  - return_to_start: bool         # round trip back to start?
+  - avg_speed_mph: float          # driving speed, to convert miles → hours
+  - service_time_minutes: float   # unload time per stop
+  - max_work_hours: float         # shift length; route trimmed to fit
 ```
+
+Each vehicle entry represents one **driver + truck unit** ("delivery guy").
+Fleets can be homogeneous (one shared config × N drivers) or heterogeneous
+(an explicit `drivers` array where each driver has their own home, shift
+length, speed, and capacity).
+
+### How time is budgeted
+
+```
+driving_hours = total_distance_miles / avg_speed_mph
+service_hours = stop_count * service_time_minutes / 60
+shift_hours   = driving_hours + service_hours
+```
+
+If `shift_hours` exceeds `max_work_hours` (or distance exceeds
+`max_distance_miles`), the solver drops the farthest tail stops from that
+driver's route into `unassigned` and re-sequences, until the route fits the
+budget.
 
 ### Output
 

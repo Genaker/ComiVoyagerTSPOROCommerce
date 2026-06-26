@@ -207,6 +207,216 @@ class VRPSolverTest extends TestCase
         self::assertLessThan(200, $result->getTotalDistanceMiles());
     }
 
+    public function testWorkHoursBudgetTrimsStops(): void
+    {
+        $depot = new Coordinate(40.71, -74.01);
+        // Spread stops over a wide area so the route is long
+        $orders = [];
+        for ($i = 0; $i < 8; $i++) {
+            $orders[] = $this->order("O$i", 40.71 + $i * 0.15, -74.01 + $i * 0.15, 1000);
+        }
+
+        // Very short shift: 1 hour at 30 mph, 10 min/stop — can only do a couple stops
+        $vehicle = new Vehicle(
+            1,
+            capacityLbs: 40000,
+            avgSpeedMph: 30.0,
+            serviceTimeMinutes: 10.0,
+            maxWorkHours: 1.0,
+        );
+
+        $result = $this->solver->solve($orders, [$vehicle], $depot);
+
+        // Some orders must be dropped to fit the 1-hour shift
+        self::assertGreaterThan(0, count($result->getUnassigned()));
+
+        // The assigned route must respect the time budget
+        foreach ($result->getRoutes() as $route) {
+            if ($route->getStopCount() > 0) {
+                self::assertLessThanOrEqual(1.0, $route->getTotalDurationHours());
+            }
+        }
+    }
+
+    public function testMaxDistanceBudgetTrimsStops(): void
+    {
+        $depot = new Coordinate(40.71, -74.01);
+        $orders = [];
+        for ($i = 0; $i < 6; $i++) {
+            $orders[] = $this->order("O$i", 40.71 + $i * 0.2, -74.01, 1000);
+        }
+
+        // Tight 20-mile distance cap
+        $vehicle = new Vehicle(1, capacityLbs: 40000, maxDistanceMiles: 20.0);
+
+        $result = $this->solver->solve($orders, [$vehicle], $depot);
+
+        self::assertGreaterThan(0, count($result->getUnassigned()));
+        foreach ($result->getRoutes() as $route) {
+            if ($route->getStopCount() > 0) {
+                self::assertLessThanOrEqual(20.0, $route->getTotalDistanceMiles());
+            }
+        }
+    }
+
+    public function testGenerousWorkHoursAssignsAll(): void
+    {
+        $depot = new Coordinate(40.71, -74.01);
+        $orders = [
+            $this->order('A', 40.72, -74.00, 1000),
+            $this->order('B', 40.73, -73.99, 1000),
+            $this->order('C', 40.74, -73.98, 1000),
+        ];
+        $vehicle = new Vehicle(1, capacityLbs: 40000, maxWorkHours: 24.0);
+
+        $result = $this->solver->solve($orders, [$vehicle], $depot);
+
+        self::assertSame(3, $result->getTotalOrdersAssigned());
+        self::assertEmpty($result->getUnassigned());
+    }
+
+    public function testPerDriverStartLocation(): void
+    {
+        $depot = new Coordinate(40.71, -74.01);
+        $orders = [
+            $this->order('A', 41.50, -73.50, 1000),
+            $this->order('B', 41.52, -73.48, 1000),
+        ];
+
+        // Driver starts from their own home, near the orders (not the depot)
+        $home = new Coordinate(41.51, -73.49);
+        $vehicle = new Vehicle(1, capacityLbs: 40000, startLocation: $home);
+
+        $result = $this->solver->solve($orders, [$vehicle], $depot);
+
+        self::assertSame(2, $result->getTotalOrdersAssigned());
+        // Distance from the nearby home should be small (< 20 mi round trip)
+        self::assertLessThan(20.0, $result->getRoutes()[0]->getTotalDistanceMiles());
+    }
+
+    public function testOneWayRouteShorterThanRoundTrip(): void
+    {
+        $depot = new Coordinate(40.71, -74.01);
+        $orders = [
+            $this->order('A', 40.80, -73.90, 1000),
+            $this->order('B', 40.90, -73.80, 1000),
+            $this->order('C', 41.00, -73.70, 1000),
+        ];
+
+        $roundTrip = $this->solver->solve($orders, [new Vehicle(1, 40000, returnToStart: true)], $depot);
+        $oneWay = $this->solver->solve($orders, [new Vehicle(1, 40000, returnToStart: false)], $depot);
+
+        $rtDist = $roundTrip->getRoutes()[0]->getTotalDistanceMiles();
+        $owDist = $oneWay->getRoutes()[0]->getTotalDistanceMiles();
+
+        self::assertGreaterThan($owDist, $rtDist);
+    }
+
+    public function testDurationReportedInSummary(): void
+    {
+        $depot = new Coordinate(40.71, -74.01);
+        $orders = [
+            $this->order('A', 40.72, -74.00, 1000),
+            $this->order('B', 40.73, -73.99, 1000),
+        ];
+        $vehicle = new Vehicle(1, capacityLbs: 40000, avgSpeedMph: 30.0, serviceTimeMinutes: 15.0);
+
+        $result = $this->solver->solve($orders, [$vehicle], $depot);
+        $array = $result->toArray();
+
+        self::assertArrayHasKey('total_duration_hours', $array['routes'][0]);
+        self::assertArrayHasKey('max_route_duration_hours', $array['summary']);
+        // 2 stops * 15 min service = 0.5h minimum, plus driving
+        self::assertGreaterThanOrEqual(0.5, $array['routes'][0]['total_duration_hours']);
+    }
+
+    public function testStopDetailsHaveSequentialEtas(): void
+    {
+        $depot = new Coordinate(40.71, -74.01);
+        $orders = [
+            $this->order('A', 40.75, -73.95, 1000),
+            $this->order('B', 40.78, -73.92, 1000),
+            $this->order('C', 40.80, -73.90, 1000),
+        ];
+        $vehicle = new Vehicle(1, capacityLbs: 40000, avgSpeedMph: 30.0, serviceTimeMinutes: 12.0);
+
+        $result = $this->solver->solve($orders, [$vehicle], $depot);
+        $route = $result->getRoutes()[0];
+        $details = $route->getStopDetails();
+
+        self::assertCount(3, $details);
+
+        // Sequence numbers are 1, 2, 3
+        self::assertSame([1, 2, 3], array_map(fn($d) => $d->sequence, $details));
+
+        // Arrival times strictly increase
+        $prev = -1.0;
+        foreach ($details as $d) {
+            self::assertGreaterThan($prev, $d->arrivalHours);
+            // departure = arrival + 12 min service
+            self::assertEqualsWithDelta($d->arrivalHours + 12.0 / 60.0, $d->departureHours, 0.0001);
+            $prev = $d->departureHours;
+        }
+
+        // Cumulative distance is monotonic and ends below total
+        $lastCumulative = end($details)->cumulativeDistanceMiles;
+        self::assertLessThanOrEqual($route->getTotalDistanceMiles() + 0.01, $lastCumulative);
+    }
+
+    public function testFirstStopLegFromStart(): void
+    {
+        $depot = new Coordinate(40.71, -74.01);
+        $orders = [$this->order('A', 40.75, -73.99, 1000)];
+        $vehicle = new Vehicle(1, capacityLbs: 40000, avgSpeedMph: 30.0, serviceTimeMinutes: 0.0);
+
+        $result = $this->solver->solve($orders, [$vehicle], $depot);
+        $details = $result->getRoutes()[0]->getStopDetails();
+
+        self::assertCount(1, $details);
+        // Leg distance from depot to the single stop is > 0
+        self::assertGreaterThan(0, $details[0]->legDistanceMiles);
+        // First stop's cumulative distance equals its leg distance
+        self::assertEqualsWithDelta($details[0]->legDistanceMiles, $details[0]->cumulativeDistanceMiles, 0.0001);
+        // arrival = legMiles / 30 mph, no service time
+        self::assertEqualsWithDelta($details[0]->legDistanceMiles / 30.0, $details[0]->arrivalHours, 0.0001);
+    }
+
+    public function testEtaConsistentWithTotalDuration(): void
+    {
+        $depot = new Coordinate(40.71, -74.01);
+        $orders = [
+            $this->order('A', 40.72, -74.00, 1000),
+            $this->order('B', 40.74, -73.98, 1000),
+        ];
+        $vehicle = new Vehicle(1, capacityLbs: 40000, avgSpeedMph: 25.0, serviceTimeMinutes: 10.0, returnToStart: false);
+
+        $result = $this->solver->solve($orders, [$vehicle], $depot);
+        $route = $result->getRoutes()[0];
+        $details = $route->getStopDetails();
+
+        // For an open route, the last stop's departure (arrival + service)
+        // should equal the route's total duration (no return leg).
+        $lastDeparture = end($details)->departureHours;
+        self::assertEqualsWithDelta($route->getTotalDurationHours(), $lastDeparture, 0.001);
+    }
+
+    public function testStopDetailsInToArray(): void
+    {
+        $depot = new Coordinate(40.71, -74.01);
+        $orders = [$this->order('ORD-1', 40.72, -74.00, 5000)];
+        $vehicle = new Vehicle(1, capacityLbs: 40000);
+
+        $array = $this->solver->solve($orders, [$vehicle], $depot)->toArray();
+        $stopDetails = $array['routes'][0]['stop_details'];
+
+        self::assertCount(1, $stopDetails);
+        self::assertSame('ORD-1', $stopDetails[0]['order_id']);
+        self::assertArrayHasKey('eta_minutes', $stopDetails[0]);
+        self::assertArrayHasKey('leg_distance_miles', $stopDetails[0]);
+        self::assertArrayHasKey('cumulative_distance_miles', $stopDetails[0]);
+        self::assertArrayHasKey('return_leg_miles', $array['routes'][0]);
+    }
+
     private function order(string $id, float $lat, float $lng, float $weight = 0.0): DeliveryOrder
     {
         return new DeliveryOrder($id, new Coordinate($lat, $lng), $weight);

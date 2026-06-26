@@ -10,9 +10,16 @@ final class VRPRoute
     private array $stops;
     private float $totalDistanceMiles = 0.0;
     private float $totalWeightLbs = 0.0;
+    private float $totalDurationHours = 0.0;
 
     /** @var Leg[] */
     private array $legs = [];
+
+    /** @var RouteStop[] per-stop leg distance + ETA detail */
+    private array $stopDetails = [];
+
+    /** Distance of the final return/end leg (last stop → end point), in miles. */
+    private float $finalLegMiles = 0.0;
 
     /**
      * @param DeliveryOrder[] $stops in optimized visiting order
@@ -78,11 +85,33 @@ final class VRPRoute
     {
         $this->stops = $stops;
         $this->recalculateWeight();
+        $this->recalculateDuration();
+        // Stop details are derived from a specific ordering — invalidate them
+        // until the solver recomputes ETAs for the new order.
+        $this->stopDetails = [];
     }
 
     public function setTotalDistanceMiles(float $distance): void
     {
         $this->totalDistanceMiles = $distance;
+        $this->recalculateDuration();
+    }
+
+    public function getTotalDurationHours(): float
+    {
+        return $this->totalDurationHours;
+    }
+
+    /**
+     * Driving time + per-stop service time, derived from the vehicle's
+     * average speed and service-time-per-stop settings.
+     */
+    private function recalculateDuration(): void
+    {
+        $this->totalDurationHours = $this->vehicle->estimateHours(
+            $this->totalDistanceMiles,
+            count($this->stops),
+        );
     }
 
     /** @param Leg[] $legs */
@@ -99,6 +128,28 @@ final class VRPRoute
     public function getStopIds(): array
     {
         return array_map(fn(DeliveryOrder $o) => $o->getId(), $this->stops);
+    }
+
+    /** @param RouteStop[] $details */
+    public function setStopDetails(array $details): void
+    {
+        $this->stopDetails = $details;
+    }
+
+    /** @return RouteStop[] */
+    public function getStopDetails(): array
+    {
+        return $this->stopDetails;
+    }
+
+    public function setFinalLegMiles(float $miles): void
+    {
+        $this->finalLegMiles = $miles;
+    }
+
+    public function getFinalLegMiles(): float
+    {
+        return $this->finalLegMiles;
     }
 
     private function recalculateWeight(): void

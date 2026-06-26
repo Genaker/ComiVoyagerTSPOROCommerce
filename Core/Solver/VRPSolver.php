@@ -7,10 +7,10 @@ namespace Genaker\Bundle\ComiVoyager\Core\Solver;
 use Genaker\Bundle\ComiVoyager\Core\Clustering\CapacityAdjuster;
 use Genaker\Bundle\ComiVoyager\Core\Clustering\KMeansClusterer;
 use Genaker\Bundle\ComiVoyager\Core\Contract\DistanceMatrixProviderInterface;
-use Genaker\Bundle\ComiVoyager\Core\Model\Address;
+use Genaker\Bundle\ComiVoyager\Core\Contract\VRPSolverInterface;
 use Genaker\Bundle\ComiVoyager\Core\Model\Coordinate;
 use Genaker\Bundle\ComiVoyager\Core\Model\DeliveryOrder;
-use Genaker\Bundle\ComiVoyager\Core\Model\SolveOptions;
+use Genaker\Bundle\ComiVoyager\Core\Model\RouteStop;
 use Genaker\Bundle\ComiVoyager\Core\Model\Vehicle;
 use Genaker\Bundle\ComiVoyager\Core\Model\VRPRoute;
 use Genaker\Bundle\ComiVoyager\Core\Model\VRPSolution;
@@ -20,11 +20,13 @@ use Genaker\Bundle\ComiVoyager\Core\Model\VRPSolution;
  *
  * Pipeline:
  *  1. Cluster orders into K groups (K-Means on coordinates)
- *  2. Adjust clusters for capacity/radius constraints
- *  3. Route each cluster via TSP solver (optimal visiting order)
- *  4. Return VRPSolution with per-vehicle routes + unassigned orders
+ *  2. Adjust clusters for weight capacity / max stops / delivery radius
+ *  3. Route each cluster with the vehicle's own start, end and round-trip
+ *     setting (RouteSequencer)
+ *  4. Trim each route to fit the driver's distance and time (shift) budget,
+ *     pushing dropped stops to "unassigned"
  */
-final class VRPSolver
+final class VRPSolver implements VRPSolverInterface
 {
     private const KM_TO_MILES = 0.621371;
 
@@ -32,13 +34,21 @@ final class VRPSolver
         private readonly DistanceMatrixProviderInterface $distanceProvider,
         private readonly KMeansClusterer $clusterer = new KMeansClusterer(),
         private readonly CapacityAdjuster $adjuster = new CapacityAdjuster(),
-        private readonly TopNRouteSolver $tspSolver = new TopNRouteSolver(),
+        private ?RouteSequencer $sequencer = null,
     ) {
+        $this->sequencer ??= new RouteSequencer($distanceProvider);
+    }
+
+    public function getName(): string
+    {
+        return 'local';
     }
 
     /**
      * @param DeliveryOrder[] $orders
      * @param Vehicle[] $vehicles
+     * @param Coordinate $depot Shared warehouse / fallback start when a
+     *        vehicle has no explicit start location.
      */
     public function solve(
         array $orders,
@@ -50,75 +60,119 @@ final class VRPSolver
             return new VRPSolution();
         }
 
-        $k = count($vehicles);
-
-        $clusters = $this->clusterer->cluster($orders, $k, $depot);
-
+        $clusters = $this->clusterer->cluster($orders, count($vehicles), $depot);
         $adjusted = $this->adjuster->adjust($clusters, $vehicles, $depot, $maxRadiusMiles);
 
         /** @var VRPRoute[] $routes */
         $routes = $adjusted['routes'];
+        $unassigned = $adjusted['unassigned'];
 
         foreach ($routes as $route) {
-            if ($route->getStopCount() < 2) {
-                if ($route->getStopCount() === 1) {
-                    $this->setSingleStopDistance($route, $depot);
-                }
-                continue;
-            }
-            $this->optimizeRoute($route, $depot);
+            $this->routeAndBudget($route, $depot, $unassigned);
         }
 
-        return new VRPSolution($routes, $adjusted['unassigned'], $adjusted['out_of_range']);
+        return new VRPSolution($routes, $unassigned, $adjusted['out_of_range']);
     }
 
-    private function optimizeRoute(VRPRoute $route, Coordinate $depot): void
+    /**
+     * Sequence the route's stops, then enforce the vehicle's distance and
+     * time budgets by dropping the farthest tail stops into $unassigned.
+     *
+     * @param DeliveryOrder[] $unassigned passed by reference
+     */
+    private function routeAndBudget(VRPRoute $route, Coordinate $depot, array &$unassigned): void
     {
-        $stops = $route->getStops();
-
-        $addresses = [new Address('__depot__', $depot)];
-        foreach ($stops as $order) {
-            $addresses[] = new Address($order->getId(), $order->getCoordinate());
-        }
-
-        $coordinates = array_map(fn(Address $a) => $a->coordinate, $addresses);
-        $matrix = $this->distanceProvider->build($coordinates);
-
-        $options = new SolveOptions(returnToStart: true, depotIndex: 0);
-        $result = $this->tspSolver->solve($addresses, $matrix, 1, $options);
-
-        if (empty($result->routes)) {
+        if ($route->getStopCount() === 0) {
             return;
         }
 
-        $bestRoute = $result->routes[0];
+        $vehicle = $route->getVehicle();
+        $start = $vehicle->resolveStart($depot);
+        $end = $vehicle->resolveEnd($depot);
 
-        // Reorder stops according to TSP solution (skip depot)
-        $orderMap = [];
-        foreach ($stops as $order) {
-            $orderMap[$order->getId()] = $order;
+        $this->sequenceRoute($route, $start, $end);
+
+        // Trim until distance and time budgets are satisfied. Each iteration
+        // removes the last stop in the optimized order (the farthest point of
+        // the day) and re-sequences the remainder.
+        while ($route->getStopCount() > 0 && $this->overBudget($route)) {
+            $dropped = $route->removeStop($route->getStopCount() - 1);
+            if ($dropped !== null) {
+                $unassigned[] = $dropped;
+            }
+            if ($route->getStopCount() > 0) {
+                $this->sequenceRoute($route, $start, $end);
+            } else {
+                $route->setTotalDistanceMiles(0.0);
+            }
         }
+    }
+
+    private function sequenceRoute(VRPRoute $route, Coordinate $start, ?Coordinate $end): void
+    {
+        $vehicle = $route->getVehicle();
+        $stops = $route->getStops();
+        $coords = array_map(static fn (DeliveryOrder $o) => $o->getCoordinate(), $stops);
+
+        $result = $this->sequencer->sequence(
+            $coords,
+            $start,
+            $end,
+            $vehicle->shouldReturnToStart(),
+        );
 
         $reordered = [];
-        foreach ($bestRoute->stops as $stop) {
-            $label = $stop->address->label;
-            if ($label === '__depot__') {
-                continue;
-            }
-            if (isset($orderMap[$label])) {
-                $reordered[] = $orderMap[$label];
-            }
+        foreach ($result['order'] as $idx) {
+            $reordered[] = $stops[$idx];
         }
 
         $route->setStops($reordered);
-        $route->setTotalDistanceMiles($bestRoute->totalDistanceKm * self::KM_TO_MILES);
+        $route->setTotalDistanceMiles($result['distanceKm'] * self::KM_TO_MILES);
+        $route->setFinalLegMiles($result['finalLegKm'] * self::KM_TO_MILES);
+
+        // Build per-stop ETA detail from the per-leg distances. The shift
+        // clock starts at 0 hours when the driver leaves the start location.
+        $speed = $vehicle->getAvgSpeedMph();
+        $serviceHours = $vehicle->getServiceTimeMinutes() / 60.0;
+
+        $details = [];
+        $clock = 0.0;
+        $cumulativeMiles = 0.0;
+        foreach ($result['order'] as $seq => $idx) {
+            $legMiles = $result['legsKm'][$seq] * self::KM_TO_MILES;
+            $cumulativeMiles += $legMiles;
+
+            $arrival = $clock + $legMiles / $speed;
+            $departure = $arrival + $serviceHours;
+            $clock = $departure;
+
+            $details[] = new RouteStop(
+                $seq + 1,
+                $reordered[$seq],
+                $legMiles,
+                $cumulativeMiles,
+                $arrival,
+                $departure,
+            );
+        }
+
+        $route->setStopDetails($details);
     }
 
-    private function setSingleStopDistance(VRPRoute $route, Coordinate $depot): void
+    private function overBudget(VRPRoute $route): bool
     {
-        $coordinates = [$depot, $route->getStops()[0]->getCoordinate()];
-        $matrix = $this->distanceProvider->build($coordinates);
-        $distanceKm = $matrix->distanceBetween(0, 1) + $matrix->distanceBetween(1, 0);
-        $route->setTotalDistanceMiles($distanceKm * self::KM_TO_MILES);
+        $vehicle = $route->getVehicle();
+
+        if ($vehicle->hasDistanceLimit() &&
+            $route->getTotalDistanceMiles() > $vehicle->getMaxDistanceMiles()) {
+            return true;
+        }
+
+        if ($vehicle->hasTimeLimit() &&
+            $route->getTotalDurationHours() > $vehicle->getMaxWorkHours()) {
+            return true;
+        }
+
+        return false;
     }
 }
